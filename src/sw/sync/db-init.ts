@@ -27,6 +27,13 @@ async function _boot() {
 
     let _tickTimer = false;
     let _pollTimer: ReturnType<typeof setInterval> | undefined;
+    
+    // Adaptive polling state
+    let _pollingInterval = StockOS_CONFIG.POLL_INTERVAL;
+    let _consecutiveEmptyPolls = 0;
+    const POLLING_MIN = 5_000;      // 5s minimum
+    const POLLING_MAX = 60_000;     // 60s maximum
+    const POLLING_FACTOR = 1.5;     // Exponential backoff factor
 
     serverDB.on({
         /**
@@ -59,13 +66,40 @@ async function _boot() {
 
         'startPolling': () => {
             if (_pollTimer) clearInterval(_pollTimer);
-            _pollTimer = setInterval(() => _tick(), StockOS_CONFIG.POLL_INTERVAL);
+            _pollTimer = setInterval(() => _tick(), _pollingInterval);
             _tick(); // run immediately
         },
 
         'stopPolling': () => {
             if (_pollTimer) clearInterval(_pollTimer);
             _pollTimer = undefined;
+        },
+        
+        /**
+         * Called after each poll to adjust interval based on activity.
+         * Resets to minimum on changes, increases exponentially on empty polls.
+         */
+        'poll:adjust': (hasChanges: boolean) => {
+            if (hasChanges) {
+                // Reset on activity - respond quickly to changes
+                _consecutiveEmptyPolls = 0;
+                _pollingInterval = POLLING_MIN;
+            } else {
+                // Exponential backoff on empty polls
+                _consecutiveEmptyPolls++;
+                _pollingInterval = Math.min(
+                    _pollingInterval * POLLING_FACTOR,
+                    POLLING_MAX
+                );
+            }
+            
+            // Restart timer with new interval
+            if (_pollTimer) {
+                clearInterval(_pollTimer);
+                _pollTimer = setInterval(() => _tick(), _pollingInterval);
+            }
+            
+            console.debug(`[SW] Adaptive polling: ${_pollingInterval}ms (empty: ${_consecutiveEmptyPolls})`);
         },
     });
 

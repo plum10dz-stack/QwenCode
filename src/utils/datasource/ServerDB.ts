@@ -84,7 +84,14 @@ export class ServerDB extends Datasource<Row> {
     async sync(since: Date | number = new Date(0)): Promise<void> {
         const tables = await this.getUpdates(since);
         if (!tables || typeof tables !== 'object') return;
+        
+        // Check if there are any changes for adaptive polling
+        const hasChanges = Object.values(tables as Record<string, Row[]>).some(rows => rows.length > 0);
+        
         this.emit('updates', { data: tables as Record<string, Row[]>, time: Date.now() });
+        
+        // Emit adjustment event for adaptive polling
+        this.emit('poll:adjust', hasChanges);
     }
 
     /**

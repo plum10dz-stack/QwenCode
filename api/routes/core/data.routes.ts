@@ -5,7 +5,20 @@ compileAPIS({
     GET: {
         async "/data/:table"(packet: Packet) {
             const table = packet.params.table;
-            return packet.validate(await packet.db.from(table).select('*') as any as requestResults<any>)
+            const since = packet.query?.since;
+            
+            let query = packet.db.from(table).select('*');
+            
+            // Filter by updated_at if since parameter is provided
+            if (since) {
+                const sinceTime = new Date(Number(since) || 0);
+                query = query.gt('updated_at', sinceTime.toISOString());
+            }
+            
+            // Apply ordering to ensure consistent results
+            query = query.order('updated_at', { ascending: true });
+            
+            return packet.validate(await query as any as requestResults<any>)
         },
         async "/data/:table/:id"(packet: Packet) {
             const table = packet.params.table;
