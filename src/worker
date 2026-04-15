@@ -1,0 +1,309 @@
+/**
+ * flow/sw/worker.js
+ *
+ * Service Worker entry point — plain browser ES module, no build step.
+ *
+ * File layout expected on the server
+ * ────────────────────────────────────
+ * Place this file (and the whole flow/ folder) at a path your web server
+ * can serve statically.  The SW must be served from the same origin as
+ * your app.  The simplest layout:
+ *
+ *   /                        ← web root
+ *   ├── index.html
+ *   └── flow/
+ *       ├── config.js
+ *       ├── broadcast.js
+ *       ├── types.js
+ *       └── sw/
+ *           ├── worker.js    ← this file (served at /flow/sw/worker.js)
+ *           ├── LocalDB.js
+ *           ├── ServerDB.js
+ *           └── EventEmitter.js
+ *
+ * Registration (in your app's main JS):
+ *   navigator.serviceWorker.register('/flow/sw/worker.js', { type: 'module' })
+ *
+ * Browser support:
+ *   Module-type Service Workers are supported in Chrome 91+, Edge 91+,
+ *   Safari 16.4+, and Firefox 116+.
+ *   For older browsers, bundle this file with any ES-module bundler that
+ *   produces a single IIFE/UMD script, then register without { type: 'module' }.
+ *
+ * lastTimeUpdate
+ * ──────────────
+ * Seeded on every boot by the Orchestrator via SW_INIT (value read from
+ * localStorage by the main thread).  Each time the watermark advances,
+ * LocalDB broadcasts LAST_UPDATE so the main thread saves it to localStorage,
+ * ensuring it survives SW restarts.
+ */
+
+import { StockOS_CONFIG } from './flow/config.js'
+import { ServerDB } from './utils/ServerDB.js'
+import { LocalDB } from './utils/LocalDB.js'
+import { broadcast, listenFor, EVT } from './utils/broadcast.js'
+import { Channel, ISWChannel, request, response, message, RequestState, ResponseState, CallState } from './utils/ServiceWorkerChannel.js';
+const swChannel = new Channel(new ISWChannel());
+
+
+// ── Singleton state ────────────────────────────────────────────────────────
+const swUrl = new URL(self.location.href);
+const tParam = swUrl.searchParams.get('t');
+if (tParam) throw new Error("no permited");
+
+/** @type {LocalDB|null} */
+let localDB = null
+
+/** @type {ServerDB|null} */
+let serverDB = null
+
+
+// ── Background Sync API (optional, Chrome/Edge only) ─────────────────────
+
+self.addEventListener('periodicsync', (e) => {
+  if (e.tag === 'flow-queue-flush' && localDB && serverDB) {
+    e.waitUntil(localDB.flushQueue(serverDB))
+  }
+})
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+function _reply(reqId, payload) {
+  broadcast(`${EVT.CMD_RESULT}:${reqId}`, payload)
+}
+
+
+
+// ── Install / Activate ────────────────────────────────────────────────────
+
+self.addEventListener('install', () => {
+
+  return self.skipWaiting();
+})
+
+self.addEventListener('activate', (e) => {
+  
+  const claims = self.clients.claim();
+  claims.then(() => {
+    
+    _boot();
+  })
+  e.waitUntil(claims);
+})
+
+// ── Boot ───────────────────────────────────────────────────────────────────
+
+async function _boot() {
+  localDB = new LocalDB(StockOS_CONFIG)
+  await localDB.init()
+
+  serverDB = new ServerDB(StockOS_CONFIG)
+  let timer = null;
+  serverDB.on({
+    'initialization': async (data) => {
+
+    },
+    'updates': async (payload) => {
+      try {
+
+        await localDB.applyServerUpdates(payload.data)
+        await localDB.setLastTimeUpdate(payload.time);
+      } catch (err) {
+        console.error('[SW] applyServerUpdates failed:', err)
+      }
+    },
+    'connection': (data) => broadcast(EVT.CONNECTION, { online: true, hasServer: true, data }),
+    'error': ({ error }) => broadcast(EVT.CONNECTION, { online: false, hasServer: false, error }),
+    'startPolling': () => {
+      if (timer) clearInterval(timer);
+      timer = setInterval(() => _tick(), StockOS_CONFIG.POLL_INTERVAL);
+      _tick();
+    },
+    'stopPolling': () => {
+      if (timer) clearInterval(timer);
+      timer = null;
+    },
+  })
+
+
+
+  // Signal readiness — Orchestrator will respond with SW_INIT
+  broadcast(EVT.PONG, { ready: true });
+  serverDB.startPolling();
+}
+let _tickTimer = null;
+async function _tick() {
+  if (_tickTimer) return;
+  _tickTimer = true;
+
+  try {
+    const time = Date.now();
+    const { data: response } = await serverDB.getUpdates(await localDB.getLastTimeUpdate());
+    await localDB.applyServerUpdates(response, time);
+    broadcast(EVT.CONNECTION, { online: true, hasServer: true });
+  } catch (err) {
+    broadcast(EVT.CONNECTION, { online: false, hasServer: false, error: err.message });
+  } finally {
+    _tickTimer = false;
+  }
+}
+listenFor(EVT.SW_INIT, async ({ lastTimeUpdate }) => {
+  // Seed watermark so the first poll is a delta, not a full reload
+  if (lastTimeUpdate && localDB) {
+
+    await localDB.setLastTimeUpdate(lastTimeUpdate)
+  }
+  if (localDB && serverDB) {
+    serverDB.startPolling()
+    await localDB.flushQueue(serverDB)
+  }
+})
+
+// ── Auth ──────────────────────────────────────────────────────────────────
+
+listenFor(EVT.AUTH_SET, async ({ }) => {
+  if (localDB && serverDB) {
+    serverDB.startPolling()
+    await localDB.flushQueue(serverDB)
+  }
+})
+
+listenFor(EVT.AUTH_CLEAR, async () => {
+  serverDB?.stopPolling()
+})
+
+// ── Ping ──────────────────────────────────────────────────────────────────
+
+listenFor(EVT.PING, () => broadcast(EVT.PONG, { ready: !!localDB }))
+
+// ── Queue flush ───────────────────────────────────────────────────────────
+
+listenFor(EVT.CMD_FLUSH_QUEUE, async () => {
+  if (localDB && serverDB) {
+    await localDB.flushQueue(serverDB)
+  }
+})
+
+// ── Read commands ─────────────────────────────────────────────────────────
+
+listenFor(EVT.CMD_GET_ALL, async ({ tableName, reqId }) => {
+  try { _reply(reqId, { rows: await localDB.getAll(tableName) }) }
+  catch (e) { _reply(reqId, { error: e.message }) }
+})
+
+listenFor(EVT.CMD_GET, async ({ tableName, id, reqId }) => {
+  try { _reply(reqId, { row: (await localDB.get(tableName, id)) ?? null }) }
+  catch (e) { _reply(reqId, { error: e.message }) }
+})
+
+listenFor(EVT.CMD_GET_BY_INDEX, async ({ tableName, indexName, value, reqId }) => {
+  try { _reply(reqId, { rows: await localDB.getByIndex(tableName, indexName, value) }) }
+  catch (e) { _reply(reqId, { error: e.message }) }
+})
+
+// ── Write commands ────────────────────────────────────────────────────────
+
+listenFor(EVT.CMD_CREATE, async ({ tableName, data, reqId }) => {
+  if (!localDB) return _reply(reqId, { error: 'LocalDB not ready' })
+  try {
+    if (serverDB) {
+      try {
+        const serverRow = await serverDB.create(tableName, data)
+        const row = await localDB.insert(tableName, { ...serverRow, syncStatus: 'synced' })
+        return _reply(reqId, { row })
+      } catch (serverErr) {
+        console.warn('[SW] server create failed, queueing offline:', serverErr.message)
+      }
+    }
+    const row = await localDB.insert(tableName, data)
+    await localDB.enqueue('insert', tableName, row)
+    _reply(reqId, { row })
+  } catch (e) { _reply(reqId, { error: e.message }) }
+})
+
+listenFor(EVT.CMD_UPDATE, async ({ tableName, id, changes, reqId }) => {
+  if (!localDB) return _reply(reqId, { error: 'LocalDB not ready' })
+  try {
+    if (serverDB) {
+      try {
+        const serverRow = await serverDB.update(tableName, id, changes)
+        const row = await localDB.update(tableName, id, { ...serverRow, syncStatus: 'synced' })
+        return _reply(reqId, { row })
+      } catch (serverErr) {
+        console.warn('[SW] server update failed, queueing offline:', serverErr.message)
+      }
+    }
+    const row = await localDB.update(tableName, id, changes)
+    await localDB.enqueue('update', tableName, row)
+    _reply(reqId, { row })
+  } catch (e) { _reply(reqId, { error: e.message }) }
+})
+
+listenFor(EVT.CMD_DELETE, async ({ tableName, id, reqId }) => {
+  if (!localDB) return _reply(reqId, { error: 'LocalDB not ready' })
+  try {
+    if (serverDB) {
+      try {
+        await serverDB.delete(tableName, id)
+        await localDB.delete(tableName, id)
+        return _reply(reqId, { ok: true })
+      } catch (serverErr) {
+        console.warn('[SW] server delete failed, queueing offline:', serverErr.message)
+      }
+    }
+    await localDB.delete(tableName, id)
+    const existing = (await localDB.get(tableName, id)) ?? { id }
+    await localDB.enqueue('delete', tableName, existing)
+    _reply(reqId, { ok: true })
+  } catch (e) { _reply(reqId, { error: e.message }) }
+});
+
+self.addEventListener('message', async (event) => {
+  const { type, payload } = event.data;
+  let result = undefined;
+  switch (type) {
+    case EVT.CMD_GET_ALL:
+      result = localDB.getAll(payload.tableName);
+      break;
+    case EVT.CMD_GET:
+      result = localDB.get(payload.tableName, payload.id);
+      break;
+    case EVT.CMD_GET_BY_INDEX:
+      result = localDB.getByIndex(payload.tableName, payload.indexName, payload.value);
+      break;
+    case EVT.CMD_CREATE:
+      result = localDB.create(payload.tableName, payload.data);
+      break;
+    case EVT.CMD_CREATE:
+      result = localDB.create(payload.tableName, payload.data);
+      break;
+    case EVT.CMD_UPDATE:
+      result = localDB.update(payload.tableName, payload.id, payload.changes);
+      break;
+    case EVT.CMD_DELETE:
+      result = localDB.delete(payload.tableName, payload.id);
+      break;
+    case EVT.CMD_FLUSH_QUEUE:
+      result = localDB.flushQueue(serverDB);
+      break;
+    case EVT.CMD_PING:
+      result = { ready: !!localDB };
+      break;
+  }
+  try {
+    result = await result;
+  } catch (error) {
+    result = { error: error.message };
+  }
+
+  const message = { type: `${EVT.CMD_RESULT}:${payload.reqId}`, payload: result };
+
+  // Prefer replying via the provided port
+  if (event.ports && event.ports.length > 0) {
+    event.ports[0].postMessage(message);
+  } else {
+    self.postMessage(message);
+  }
+
+});
+const bc = new BroadcastChannel(StockOS_CONFIG.BROADCAST_TABLES);

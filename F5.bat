@@ -1,0 +1,1 @@
+vite dev --force --cors=true --strictPort=true --clearScreen=true -d 

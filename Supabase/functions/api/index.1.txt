@@ -1,0 +1,1047 @@
+// =============================================================
+// StockOS ERP — Supabase Edge Function: Stock
+// =============================================================
+// Deploy:  supabase functions deploy Stock
+// Invoke:  POST /functions/v1/Stock
+//
+// Request body:
+//   { si: string, id: string, action: string, params: object }
+//
+// Response body:
+//   { si: string, id: string, data: any }
+//   { si: string, id: string, error: string }   ← on failure
+//
+// ─────────────────────────────────────────────
+// ACTION CATALOGUE  (group.method)
+// ─────────────────────────────────────────────
+//   categories   list | get | create | update | delete
+//   suppliers    list | get | create | update | delete
+//   customers    list | get | create | update | delete
+//   end_customers list | get | create | update | delete
+//   products     list | get | create | update | delete | adjust
+//   movements    list
+//   purchase_orders      list | get | create | update | delete
+//   purchase_order_lines list | create | update | delete
+//   sales_orders         list | get | create | update | delete
+//   sales_order_lines    list | create | update | delete
+//   s_payments   list | create | delete
+//   p_payments   list | create | delete
+//   view         customer_situation | low_stock | stock_value | supplier_summary | pol_detail | sol_detail
+//   sync         delta
+//   audit_log    list
+// =============================================================
+
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+);
+
+// ─── types ────────────────────────────────────────────────────────────────────
+
+interface StockRequest {
+  si: string;
+  id: string;
+  action: string;
+  params: Record<string, unknown>;
+}
+
+type P = Record<string, unknown>;
+type Handler = (si: string, id: string, p: P) => Promise<Response>;
+type RouterGroup = Record<string, Handler>;
+type Routers = Record<string, RouterGroup>;
+
+// ─── helpers ──────────────────────────────────────────────────────────────────
+
+function ok(si: string, id: string, data: unknown): Response {
+  return new Response(JSON.stringify({ si, id, data }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function err(si: string, id: string, message: string, status = 400): Response {
+  return new Response(JSON.stringify({ si, id, error: message }), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function pick(obj: P, keys: string[]): P {
+  const out: P = {};
+  for (const k of keys) {
+    if (Object.prototype.hasOwnProperty.call(obj, k)) out[k] = obj[k];
+  }
+  return out;
+}
+
+async function logDelete(tableName: string, rowId: string): Promise<void> {
+  await supabase
+    .from("delete_log")
+    .insert({ table_name: tableName, row_id: rowId });
+}
+
+// ─── routers ──────────────────────────────────────────────────────────────────
+
+const routers: Routers = {
+  // ════════════════════════════════════════════════════════════
+  // CATEGORIES
+  // ════════════════════════════════════════════════════════════
+  categories: {
+    async list(si, id, _p) {
+      const { data, error } = await supabase
+        .from("categories")
+        .select("*")
+        .order("name");
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async get(si, id, p) {
+      if (!p.id) return err(si, id, "params.id required");
+      const { data, error } = await supabase
+        .from("categories")
+        .select("*")
+        .eq("id", p.id)
+        .single();
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async create(si, id, p) {
+      if (!p.name || !p.abr)
+        return err(si, id, "params.name and params.abr required");
+      const { data, error } = await supabase
+        .from("categories")
+        .insert(pick(p, ["name", "abr", "ref"]))
+        .select()
+        .single();
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async update(si, id, p) {
+      if (!p.id) return err(si, id, "params.id required");
+      const { data, error } = await supabase
+        .from("categories")
+        .update(pick(p, ["name", "abr", "ref"]))
+        .eq("id", p.id)
+        .select()
+        .single();
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async delete(si, id, p) {
+      if (!p.id) return err(si, id, "params.id required");
+      const { error } = await supabase
+        .from("categories")
+        .delete()
+        .eq("id", p.id);
+      if (error) return err(si, id, error.message);
+      await logDelete("categories", String(p.id));
+      return ok(si, id, { deleted: true });
+    },
+  },
+
+  // ════════════════════════════════════════════════════════════
+  // SUPPLIERS
+  // ════════════════════════════════════════════════════════════
+  suppliers: {
+    async list(si, id, _p) {
+      const { data, error } = await supabase
+        .from("suppliers")
+        .select("*")
+        .order("name");
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async get(si, id, p) {
+      if (!p.id) return err(si, id, "params.id required");
+      const { data, error } = await supabase
+        .from("suppliers")
+        .select("*")
+        .eq("id", p.id)
+        .single();
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async create(si, id, p) {
+      if (!p.name) return err(si, id, "params.name required");
+      const { data, error } = await supabase
+        .from("suppliers")
+        .insert(
+          pick(p, ["name", "contact", "phone", "email", "address", "notes"]),
+        )
+        .select()
+        .single();
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async update(si, id, p) {
+      if (!p.id) return err(si, id, "params.id required");
+      const { data, error } = await supabase
+        .from("suppliers")
+        .update(
+          pick(p, ["name", "contact", "phone", "email", "address", "notes"]),
+        )
+        .eq("id", p.id)
+        .select()
+        .single();
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async delete(si, id, p) {
+      if (!p.id) return err(si, id, "params.id required");
+      const { error } = await supabase
+        .from("suppliers")
+        .delete()
+        .eq("id", p.id);
+      if (error) return err(si, id, error.message);
+      await logDelete("suppliers", String(p.id));
+      return ok(si, id, { deleted: true });
+    },
+  },
+
+  // ════════════════════════════════════════════════════════════
+  // CUSTOMERS
+  // ════════════════════════════════════════════════════════════
+  customers: {
+    async list(si, id, p) {
+      let q = supabase.from("customers").select("*").order("full_name");
+      if (p.active !== undefined) q = q.eq("is_active", p.active);
+      const { data, error } = await q;
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async get(si, id, p) {
+      if (!p.id) return err(si, id, "params.id required");
+      const { data, error } = await supabase
+        .from("customers")
+        .select("*")
+        .eq("id", p.id)
+        .single();
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async create(si, id, p) {
+      if (!p.full_name) return err(si, id, "params.full_name required");
+      const { data, error } = await supabase
+        .from("customers")
+        .insert(
+          pick(p, [
+            "full_name",
+            "phone",
+            "email",
+            "city",
+            "tax_id",
+            "address",
+            "notes",
+            "is_active",
+          ]),
+        )
+        .select()
+        .single();
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async update(si, id, p) {
+      if (!p.id) return err(si, id, "params.id required");
+      const { data, error } = await supabase
+        .from("customers")
+        .update(
+          pick(p, [
+            "full_name",
+            "phone",
+            "email",
+            "city",
+            "tax_id",
+            "address",
+            "notes",
+            "is_active",
+          ]),
+        )
+        .eq("id", p.id)
+        .select()
+        .single();
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async delete(si, id, p) {
+      if (!p.id) return err(si, id, "params.id required");
+      const { error } = await supabase
+        .from("customers")
+        .delete()
+        .eq("id", p.id);
+      if (error) return err(si, id, error.message);
+      await logDelete("customers", String(p.id));
+      return ok(si, id, { deleted: true });
+    },
+  },
+
+  // ════════════════════════════════════════════════════════════
+  // END CUSTOMERS
+  // ════════════════════════════════════════════════════════════
+  end_customers: {
+    async list(si, id, p) {
+      let q = supabase.from("end_customers").select("*").order("full_name");
+      if (p.active !== undefined) q = q.eq("is_active", p.active);
+      const { data, error } = await q;
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async get(si, id, p) {
+      if (!p.id) return err(si, id, "params.id required");
+      const { data, error } = await supabase
+        .from("end_customers")
+        .select("*")
+        .eq("id", p.id)
+        .single();
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async create(si, id, p) {
+      if (!p.full_name) return err(si, id, "params.full_name required");
+      const { data, error } = await supabase
+        .from("end_customers")
+        .insert(
+          pick(p, [
+            "full_name",
+            "phone",
+            "email",
+            "city",
+            "tax_id",
+            "address",
+            "notes",
+            "is_active",
+          ]),
+        )
+        .select()
+        .single();
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async update(si, id, p) {
+      if (!p.id) return err(si, id, "params.id required");
+      const { data, error } = await supabase
+        .from("end_customers")
+        .update(
+          pick(p, [
+            "full_name",
+            "phone",
+            "email",
+            "city",
+            "tax_id",
+            "address",
+            "notes",
+            "is_active",
+          ]),
+        )
+        .eq("id", p.id)
+        .select()
+        .single();
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async delete(si, id, p) {
+      if (!p.id) return err(si, id, "params.id required");
+      const { error } = await supabase
+        .from("end_customers")
+        .delete()
+        .eq("id", p.id);
+      if (error) return err(si, id, error.message);
+      await logDelete("end_customers", String(p.id));
+      return ok(si, id, { deleted: true });
+    },
+  },
+
+  // ════════════════════════════════════════════════════════════
+  // PRODUCTS
+  // ════════════════════════════════════════════════════════════
+  products: {
+    async list(si, id, p) {
+      let q = supabase.from("products").select("*").order("name");
+      if (p.active !== undefined) q = q.eq("active", p.active);
+      if (p.category !== undefined) q = q.eq("category", p.category);
+      if (p.supplier_id !== undefined) q = q.eq("supplier_id", p.supplier_id);
+      const { data, error } = await q;
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async get(si, id, p) {
+      if (!p.id) return err(si, id, "params.id required");
+      const { data, error } = await supabase
+        .from("products")
+        .select("*")
+        .eq("id", p.id)
+        .single();
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async create(si, id, p) {
+      if (!p.name || !p.sku)
+        return err(si, id, "params.name and params.sku required");
+      const { data, error } = await supabase
+        .from("products")
+        .insert(
+          pick(p, [
+            "name",
+            "sku",
+            "category",
+            "unit",
+            "supplier_id",
+            "buy_price",
+            "sell_price",
+            "stock",
+            "low_stock",
+            "location",
+            "description",
+            "active",
+          ]),
+        )
+        .select()
+        .single();
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async update(si, id, p) {
+      if (!p.id) return err(si, id, "params.id required");
+      const { data, error } = await supabase
+        .from("products")
+        .update(
+          pick(p, [
+            "name",
+            "sku",
+            "category",
+            "unit",
+            "supplier_id",
+            "buy_price",
+            "sell_price",
+            "stock",
+            "low_stock",
+            "location",
+            "description",
+            "active",
+          ]),
+        )
+        .eq("id", p.id)
+        .select()
+        .single();
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async delete(si, id, p) {
+      if (!p.id) return err(si, id, "params.id required");
+      const { error } = await supabase.from("products").delete().eq("id", p.id);
+      if (error) return err(si, id, error.message);
+      await logDelete("products", String(p.id));
+      return ok(si, id, { deleted: true });
+    },
+
+    async adjust(si, id, p) {
+      if (!p.product_id) return err(si, id, "params.product_id required");
+      if (!p.type)
+        return err(si, id, "params.type required: 'in' | 'out' | 'adjustment'");
+      if (!p.qty) return err(si, id, "params.qty required (positive integer)");
+      if (!p.reason) return err(si, id, "params.reason required");
+
+      const { data: product, error: pErr } = await supabase
+        .from("products")
+        .select("stock")
+        .eq("id", p.product_id)
+        .single();
+      if (pErr) return err(si, id, pErr.message);
+
+      const before = product.stock as number;
+      const qty = Number(p.qty);
+      const movType = String(p.type);
+
+      let after: number;
+      if (movType === "in") after = before + qty;
+      else if (movType === "out") after = before - qty;
+      else after = qty;
+
+      if (after < 0) return err(si, id, "Stock cannot go below 0");
+
+      const { error: movErr } = await supabase.from("movements").insert({
+        product_id: p.product_id,
+        type: movType,
+        qty,
+        before,
+        after,
+        reason: p.reason,
+        ref: p.ref ?? null,
+      });
+      if (movErr) return err(si, id, movErr.message);
+
+      const { data: updated, error: upErr } = await supabase
+        .from("products")
+        .update({ stock: after })
+        .eq("id", p.product_id)
+        .select()
+        .single();
+      if (upErr) return err(si, id, upErr.message);
+
+      return ok(si, id, {
+        product: updated,
+        movement: { before, after, qty, type: movType },
+      });
+    },
+  },
+
+  // ════════════════════════════════════════════════════════════
+  // MOVEMENTS  (read-only — mutations go through products.adjust)
+  // ════════════════════════════════════════════════════════════
+  movements: {
+    async list(si, id, p) {
+      let q = supabase
+        .from("movements")
+        .select("*")
+        .order("created_at", { ascending: false });
+      if (p.product_id) q = q.eq("product_id", p.product_id);
+      if (p.type) q = q.eq("type", p.type);
+      if (p.limit) q = q.limit(Number(p.limit));
+      const { data, error } = await q;
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+  },
+
+  // ════════════════════════════════════════════════════════════
+  // PURCHASE ORDERS
+  // ════════════════════════════════════════════════════════════
+  purchase_orders: {
+    async list(si, id, p) {
+      let q = supabase
+        .from("purchase_orders")
+        .select("*")
+        .order("updated_at", { ascending: false });
+      if (p.status) q = q.eq("status", p.status);
+      if (p.supplier_id) q = q.eq("supplier_id", p.supplier_id);
+      const { data, error } = await q;
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async get(si, id, p) {
+      if (!p.id) return err(si, id, "params.id required");
+      const { data, error } = await supabase
+        .from("purchase_orders")
+        .select("*, purchase_order_lines(*)")
+        .eq("id", p.id)
+        .single();
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async create(si, id, p) {
+      if (!p.po_number) return err(si, id, "params.po_number required");
+      const { data, error } = await supabase
+        .from("purchase_orders")
+        .insert(
+          pick(p, [
+            "po_number",
+            "por",
+            "supplier_id",
+            "expected_date",
+            "status",
+            "notes",
+          ]),
+        )
+        .select()
+        .single();
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async update(si, id, p) {
+      if (!p.id) return err(si, id, "params.id required");
+      const { data, error } = await supabase
+        .from("purchase_orders")
+        .update(
+          pick(p, [
+            "po_number",
+            "por",
+            "supplier_id",
+            "expected_date",
+            "status",
+            "notes",
+            "received_at",
+          ]),
+        )
+        .eq("id", p.id)
+        .select()
+        .single();
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async delete(si, id, p) {
+      if (!p.id) return err(si, id, "params.id required");
+      const { error } = await supabase
+        .from("purchase_orders")
+        .delete()
+        .eq("id", p.id);
+      if (error) return err(si, id, error.message);
+      await logDelete("purchase_orders", String(p.id));
+      return ok(si, id, { deleted: true });
+    },
+  },
+
+  // ════════════════════════════════════════════════════════════
+  // PURCHASE ORDER LINES
+  // ════════════════════════════════════════════════════════════
+  purchase_order_lines: {
+    async list(si, id, p) {
+      if (!p.order_id) return err(si, id, "params.order_id required");
+      const { data, error } = await supabase
+        .from("purchase_order_lines")
+        .select("*, products(name, sku, unit)")
+        .eq("order_id", p.order_id)
+        .order("sort_order")
+        .order("created_at");
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async create(si, id, p) {
+      if (!p.order_id) return err(si, id, "params.order_id required");
+      if (!p.product_id) return err(si, id, "params.product_id required");
+      if (!p.qty) return err(si, id, "params.qty required");
+      const { data, error } = await supabase
+        .from("purchase_order_lines")
+        .insert(
+          pick(p, [
+            "order_id",
+            "product_id",
+            "qty",
+            "unit_price",
+            "sort_order",
+            "notes",
+          ]),
+        )
+        .select()
+        .single();
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async update(si, id, p) {
+      if (!p.id) return err(si, id, "params.id required");
+      const { data, error } = await supabase
+        .from("purchase_order_lines")
+        .update(pick(p, ["qty", "unit_price", "sort_order", "notes"]))
+        .eq("id", p.id)
+        .select()
+        .single();
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async delete(si, id, p) {
+      if (!p.id) return err(si, id, "params.id required");
+      const { error } = await supabase
+        .from("purchase_order_lines")
+        .delete()
+        .eq("id", p.id);
+      if (error) return err(si, id, error.message);
+      await logDelete("purchase_order_lines", String(p.id));
+      return ok(si, id, { deleted: true });
+    },
+  },
+
+  // ════════════════════════════════════════════════════════════
+  // SALES ORDERS
+  // ════════════════════════════════════════════════════════════
+  sales_orders: {
+    async list(si, id, p) {
+      let q = supabase
+        .from("sales_orders")
+        .select("*")
+        .order("updated_at", { ascending: false });
+      if (p.status) q = q.eq("status", p.status);
+      if (p.customer_id) q = q.eq("customer_id", p.customer_id);
+      const { data, error } = await q;
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async get(si, id, p) {
+      if (!p.id) return err(si, id, "params.id required");
+      const { data, error } = await supabase
+        .from("sales_orders")
+        .select("*, sales_order_lines(*)")
+        .eq("id", p.id)
+        .single();
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async create(si, id, p) {
+      if (!p.so_number) return err(si, id, "params.so_number required");
+      const { data, error } = await supabase
+        .from("sales_orders")
+        .insert(
+          pick(p, [
+            "so_number",
+            "customer_id",
+            "end_customer_id",
+            "delivery_date",
+            "status",
+            "tax_pct",
+            "notes",
+          ]),
+        )
+        .select()
+        .single();
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async update(si, id, p) {
+      if (!p.id) return err(si, id, "params.id required");
+      const { data, error } = await supabase
+        .from("sales_orders")
+        .update(
+          pick(p, [
+            "so_number",
+            "customer_id",
+            "end_customer_id",
+            "delivery_date",
+            "status",
+            "tax_pct",
+            "notes",
+            "shipped_at",
+            "delivered_at",
+          ]),
+        )
+        .eq("id", p.id)
+        .select()
+        .single();
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async delete(si, id, p) {
+      if (!p.id) return err(si, id, "params.id required");
+      const { error } = await supabase
+        .from("sales_orders")
+        .delete()
+        .eq("id", p.id);
+      if (error) return err(si, id, error.message);
+      await logDelete("sales_orders", String(p.id));
+      return ok(si, id, { deleted: true });
+    },
+  },
+
+  // ════════════════════════════════════════════════════════════
+  // SALES ORDER LINES
+  // ════════════════════════════════════════════════════════════
+  sales_order_lines: {
+    async list(si, id, p) {
+      if (!p.order_id) return err(si, id, "params.order_id required");
+      const { data, error } = await supabase
+        .from("sales_order_lines")
+        .select("*, products(name, sku, unit)")
+        .eq("order_id", p.order_id)
+        .order("sort_order")
+        .order("created_at");
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async create(si, id, p) {
+      if (!p.order_id) return err(si, id, "params.order_id required");
+      if (!p.product_id) return err(si, id, "params.product_id required");
+      if (!p.qty) return err(si, id, "params.qty required");
+      const { data, error } = await supabase
+        .from("sales_order_lines")
+        .insert(
+          pick(p, [
+            "order_id",
+            "product_id",
+            "qty",
+            "unit_price",
+            "sort_order",
+            "notes",
+          ]),
+        )
+        .select()
+        .single();
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async update(si, id, p) {
+      if (!p.id) return err(si, id, "params.id required");
+      const { data, error } = await supabase
+        .from("sales_order_lines")
+        .update(pick(p, ["qty", "unit_price", "sort_order", "notes"]))
+        .eq("id", p.id)
+        .select()
+        .single();
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async delete(si, id, p) {
+      if (!p.id) return err(si, id, "params.id required");
+      const { error } = await supabase
+        .from("sales_order_lines")
+        .delete()
+        .eq("id", p.id);
+      if (error) return err(si, id, error.message);
+      await logDelete("sales_order_lines", String(p.id));
+      return ok(si, id, { deleted: true });
+    },
+  },
+
+  // ════════════════════════════════════════════════════════════
+  // PAYMENTS — SALES
+  // ════════════════════════════════════════════════════════════
+  s_payments: {
+    async list(si, id, p) {
+      let q = supabase
+        .from("s_payments")
+        .select("*")
+        .order("date_created", { ascending: false });
+      if (p.order_id) q = q.eq("order_id", p.order_id);
+      if (p.customer_id) q = q.eq("customer_id", p.customer_id);
+      const { data, error } = await q;
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async create(si, id, p) {
+      if (!p.amount) return err(si, id, "params.amount required");
+      const { data, error } = await supabase
+        .from("s_payments")
+        .insert(pick(p, ["amount", "customer_id", "order_id", "date", "notes"]))
+        .select()
+        .single();
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async delete(si, id, p) {
+      if (!p.id) return err(si, id, "params.id required");
+      const { error } = await supabase
+        .from("s_payments")
+        .delete()
+        .eq("id", p.id);
+      if (error) return err(si, id, error.message);
+      await logDelete("s_payments", String(p.id));
+      return ok(si, id, { deleted: true });
+    },
+  },
+
+  // ════════════════════════════════════════════════════════════
+  // PAYMENTS — PURCHASE
+  // ════════════════════════════════════════════════════════════
+  p_payments: {
+    async list(si, id, p) {
+      let q = supabase
+        .from("p_payments")
+        .select("*")
+        .order("date_created", { ascending: false });
+      if (p.order_id) q = q.eq("order_id", p.order_id);
+      if (p.supplier_id) q = q.eq("supplier_id", p.supplier_id);
+      const { data, error } = await q;
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async create(si, id, p) {
+      if (!p.amount) return err(si, id, "params.amount required");
+      const { data, error } = await supabase
+        .from("p_payments")
+        .insert(pick(p, ["amount", "supplier_id", "order_id", "date", "notes"]))
+        .select()
+        .single();
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async delete(si, id, p) {
+      if (!p.id) return err(si, id, "params.id required");
+      const { error } = await supabase
+        .from("p_payments")
+        .delete()
+        .eq("id", p.id);
+      if (error) return err(si, id, error.message);
+      await logDelete("p_payments", String(p.id));
+      return ok(si, id, { deleted: true });
+    },
+  },
+
+  // ════════════════════════════════════════════════════════════
+  // ANALYTICS VIEWS
+  // ════════════════════════════════════════════════════════════
+  view: {
+    async customer_situation(si, id, p) {
+      let q = supabase
+        .from("v_customer_situation")
+        .select("*")
+        .order("order_date", { ascending: false });
+      if (p.customer_id) q = q.eq("customer_id", p.customer_id);
+      const { data, error } = await q;
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async low_stock(si, id, _p) {
+      const { data, error } = await supabase
+        .from("v_low_stock")
+        .select("*")
+        .order("stock");
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async stock_value(si, id, _p) {
+      const { data, error } = await supabase.from("v_stock_value").select("*");
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async supplier_summary(si, id, _p) {
+      const { data, error } = await supabase
+        .from("v_supplier_summary")
+        .select("*")
+        .order("supplier_name");
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async pol_detail(si, id, p) {
+      let q = supabase.from("v_purchase_order_lines_detail").select("*");
+      if (p.order_id) q = q.eq("order_id", p.order_id);
+      const { data, error } = await q;
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+
+    async sol_detail(si, id, p) {
+      let q = supabase.from("v_sales_order_lines_detail").select("*");
+      if (p.order_id) q = q.eq("order_id", p.order_id);
+      const { data, error } = await q;
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+  },
+
+  // ════════════════════════════════════════════════════════════
+  // DELTA SYNC
+  // ════════════════════════════════════════════════════════════
+  sync: {
+    async delta(si, id, p) {
+      if (!p.since) return err(si, id, "params.since required (ISO timestamp)");
+      const { data, error } = await supabase.rpc("get_delta", {
+        since: p.since,
+      });
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+  },
+
+  // ════════════════════════════════════════════════════════════
+  // AUDIT LOG
+  // ════════════════════════════════════════════════════════════
+  audit_log: {
+    async list(si, id, p) {
+      const limit = Number(p.limit ?? 100);
+      let q = supabase
+        .from("audit_log")
+        .select("*")
+        .order("created_at", { ascending: false })
+        .limit(limit);
+      if (p.table_name) q = q.eq("table_name", p.table_name);
+      if (p.offset) q = q.range(Number(p.offset), Number(p.offset) + limit - 1);
+      const { data, error } = await q;
+      if (error) return err(si, id, error.message);
+      return ok(si, id, data);
+    },
+  },
+};
+
+// ─── entry point ──────────────────────────────────────────────────────────────
+
+Deno.serve(async (req: Request) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, {
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      },
+    });
+  }
+
+  if (req.method !== "POST") {
+    return new Response("Method Not Allowed", { status: 405 });
+  }
+
+  let body: StockRequest;
+  try {
+    body = await req.json();
+  } catch {
+    return err("", "", "Invalid JSON body");
+  }
+
+  const si = String(body.si ?? "");
+  const id = String(body.id ?? "");
+  const action = String(body.action ?? "");
+  const params: P =
+    body.params && typeof body.params === "object" ? body.params : {};
+
+  if (!action) return err(si, id, "Missing required field: action");
+
+  return route(si, id, action, params);
+});
+
+// ─── dispatcher: splits "group.method" and looks up in routers ────────────────
+
+async function route(
+  si: string,
+  id: string,
+  action: string,
+  p: P,
+): Promise<Response> {
+  const dot = action.indexOf(".");
+  if (dot === -1)
+    return err(
+      si,
+      id,
+      `Invalid action format "${action}" — expected "group.method"`,
+    );
+
+  const group = action.slice(0, dot);
+  const method = action.slice(dot + 1);
+
+  const handler = routers[group]?.[method];
+  if (!handler) return err(si, id, `Unknown action: "${action}"`);
+
+  try {
+    return await handler(si, id, p);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return err(si, id, `Unhandled error in "${action}": ${msg}`, 500);
+  }
+}
